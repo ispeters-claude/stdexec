@@ -93,22 +93,15 @@ namespace experimental::execution
         }
         else
         {
-          using __result_t =
-            __facade::__union_t<decltype(__finish()),
-                                decltype(__next()),
-                                __facade::__effects<set_error_t(std::exception_ptr)>>;
-          bool __done = false;
-          STDEXEC_TRY
-          {
-            __done = (static_cast<bool>(static_cast<_Booleans &&>(__bools)) && ...);
-          }
-          STDEXEC_CATCH_ALL
-          {
-            __state.__cleanup();
-            return __result_t(
-              __facade::__send(__state.__rcvr_, set_error_t(), std::current_exception()));
-          }
-          return __done ? __result_t(__finish()) : __result_t(__next());
+          // Converting a boolean can throw, after which the phases end.
+          return __typestate::__catching(
+            __state.__rcvr_,
+            [&]
+            {
+              bool const __done = (static_cast<bool>(static_cast<_Booleans &&>(__bools)) && ...);
+              return __facade::__choose(__done, __finish, __next);
+            },
+            [&]() noexcept { __state.__cleanup(); });
         }
       }
     };

@@ -15,8 +15,8 @@
  */
 #pragma once
 
-#include "../../stdexec/__detail/__optional.hpp"
 #include "../../stdexec/__detail/__sender_facade.hpp"
+#include "../../stdexec/__detail/__typestate.hpp"
 #include "../../stdexec/execution.hpp"
 
 #include "../trampoline_scheduler.hpp"
@@ -116,26 +116,30 @@ namespace experimental::execution::__repeat
 
     STDEXEC_IMMOVABLE(__state);
 
-    // Connects the body of the next iteration, destroying the operation of the last one.
-    // (This happens in the last one's completion. Operations that complete must not touch
-    // themselves afterward.)
+    // Enters the phase of the next iteration's body, ending the last one's. (This happens in
+    // the last one's completion. Operations that complete must not touch themselves
+    // afterward.)
     constexpr auto __connect_body() noexcept(__nothrow_connect) -> __body_op_t &
     {
-      return __body_op_.__emplace_from(STDEXEC::connect, __child_t(__child_), __body_rcvr_t{this});
+      return __body_.template __enter<__body>(
+        [&] { return STDEXEC::connect(__child_t(__child_), __body_rcvr_t{this}); });
     }
 
-    // Destroys the operations, before the operation completes
+    // Ends the phases, before the operation completes
     constexpr void __cleanup() noexcept
     {
-      __body_op_.reset();
-      __bounce_op_.reset();
+      __body_.__end();
+      __bounce_.__end();
     }
 
-    _Receiver                 __rcvr_;
-    __data_t                  __data_;
-    __child_t                 __child_;
-    __optional<__bounce_op_t> __bounce_op_{};
-    __optional<__body_op_t>   __body_op_{};
+    _Receiver __rcvr_;
+    __data_t  __data_;
+    __child_t __child_;
+    // Each iteration has two phases, which overlap: the trampoline, which starts the body,
+    // and the body, which is connected before the trampoline starts. Each is a region of
+    // its own.
+    __typestate::__phases<__typestate::__phase<__bounce, __bounce_op_t>> __bounce_;
+    __typestate::__phases<__typestate::__phase<__body, __body_op_t>>     __body_;
   };
 
   template <class _Algo, class _Sender, class _Receiver>
@@ -233,10 +237,13 @@ namespace experimental::execution::__repeat
     static constexpr auto __start_iteration(_State &__state) noexcept
     {
       using __bounce_rcvr_t = _State::__bounce_rcvr_t;
-      auto &__op            = __state.__bounce_op_.__emplace_from(STDEXEC::connect,
-                                                       STDEXEC::schedule(trampoline_scheduler{}),
-                                                       __bounce_rcvr_t{&__state});
-      return __facade::__start_nested<__bounce>(__op);
+      return __typestate::__run<__bounce>(__state.__bounce_,
+                                          [&]() noexcept
+                                          {
+                                            return STDEXEC::connect(STDEXEC::schedule(
+                                                                      trampoline_scheduler{}),
+                                                                    __bounce_rcvr_t{&__state});
+                                          });
     }
 
     // Starts the next iteration, whose body it connects. If that throws, the operation
@@ -244,94 +251,62 @@ namespace experimental::execution::__repeat
     template <class _State>
     static constexpr auto __next(_State &__state) noexcept
     {
-      if constexpr (_State::__nothrow_connect)
-      {
-        __state.__connect_body();
-        return __algo_base::__start_iteration(__state);
-      }
-      else
-      {
-        using __result_t =
-          __facade::__union_t<decltype(__algo_base::__start_iteration(__state)),
-                              __facade::__effects<set_error_t(std::exception_ptr)>>;
-        STDEXEC_TRY
+      return __typestate::__catching(
+        __state.__rcvr_,
+        [&]() noexcept(_State::__nothrow_connect)
         {
           __state.__connect_body();
-          return __result_t(__algo_base::__start_iteration(__state));
-        }
-        STDEXEC_CATCH_ALL
-        {
-          __state.__cleanup();
-          return __result_t(
-            __facade::__send(__state.__rcvr_, set_error_t(), std::current_exception()));
-        }
-      }
+          return __algo_base::__start_iteration(__state);
+        },
+        [&]() noexcept { __state.__cleanup(); });
     }
 
     // The loop is done.
     template <class _State>
     static constexpr auto __finish(_State &__state) noexcept
     {
-      __state.__cleanup();
-      return __facade::__send(__state.__rcvr_, set_value_t());
+      return __typestate::__finish_with_copies<true>(
+        __state.__rcvr_,
+        [&]() noexcept { __state.__cleanup(); },
+        set_value_t());
     }
 
     // The trampoline starts the body.
     template <class _State>
     static constexpr auto __complete(__bounce, _State &__state, set_value_t) noexcept
     {
-      return __facade::__start_nested<__body>(*__state.__body_op_);
+      return __typestate::__start<__body>(__state.__body_);
     }
 
     // The trampoline stops if the receiver asks it to.
     template <class _State>
     static constexpr auto __complete(__bounce, _State &__state, set_stopped_t) noexcept
     {
-      __state.__cleanup();
-      return __facade::__send(__state.__rcvr_, set_stopped_t());
+      return __typestate::__finish_with_copies<true>(
+        __state.__rcvr_,
+        [&]() noexcept { __state.__cleanup(); },
+        set_stopped_t());
     }
 
-    // The body's errors are the operation's. An error is copied before the body's operation
-    // is destroyed, because it may be in it.
+    // The body's errors are the operation's. An error is copied before the body's phase
+    // ends, because it may be in the body's operation.
     template <class _State, class _Error>
     static constexpr auto __complete(__body, _State &__state, set_error_t, _Error &&__err) noexcept
     {
-      using __copy_t   = __decay_t<_Error>;
-      using __sent_t   = std::conditional_t<_Derived::__decays_errors, __copy_t &&, _Error &&>;
-      auto __send_copy = [&]()
-      {
-        __copy_t __copy(static_cast<_Error &&>(__err));
-        __state.__cleanup();
-        return __facade::__send(__state.__rcvr_, set_error_t(), static_cast<__sent_t>(__copy));
-      };
-
-      if constexpr (__nothrow_decay_copyable<_Error>)
-      {
-        return __send_copy();
-      }
-      else
-      {
-        using __result_t =
-          __facade::__union_t<decltype(__send_copy()),
-                              __facade::__effects<set_error_t(std::exception_ptr)>>;
-        STDEXEC_TRY
-        {
-          return __result_t(__send_copy());
-        }
-        STDEXEC_CATCH_ALL
-        {
-          __state.__cleanup();
-          return __result_t(
-            __facade::__send(__state.__rcvr_, set_error_t(), std::current_exception()));
-        }
-      }
+      return __typestate::__finish_with_copies<_Derived::__decays_errors>(
+        __state.__rcvr_,
+        [&]() noexcept { __state.__cleanup(); },
+        set_error_t(),
+        static_cast<_Error &&>(__err));
     }
 
     template <class _State>
     static constexpr auto __complete(__body, _State &__state, set_stopped_t) noexcept
     {
-      __state.__cleanup();
-      return __facade::__send(__state.__rcvr_, set_stopped_t());
+      return __typestate::__finish_with_copies<true>(
+        __state.__rcvr_,
+        [&]() noexcept { __state.__cleanup(); },
+        set_stopped_t());
     }
   };
 }  // namespace experimental::execution::__repeat
