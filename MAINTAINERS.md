@@ -102,6 +102,7 @@ These algorithms use the facade, and are good examples:
 | `bulk`, `bulk_chunked`, `bulk_unchunked` | `__bulk.hpp` | one algorithm for several tags |
 | `exec::repeat_n`, `exec::repeat_until`, `exec::repeat` | `exec/detail/repeat.hpp` | loops |
 | `exec::split`, `exec::ensure_started` | `exec/detail/shared.hpp` | a shared operation; a sender that describes another |
+| `associate` | `__associate.hpp` | a nested sender held by the data, known only by its type |
 
 ### The shape of an algorithm
 
@@ -338,10 +339,10 @@ return __typestate::__catching(
   });
 ```
 
-The phases of `let_value`, `__sequence`, `exec::repeat_n`, `exec::repeat_until`
-and `exec::repeat`, and the received results of `continues_on`, are written
-this way. Algorithms whose nested operations all live as long as the operation
-(`starts_on`, `when_all`) have no phases.
+The phases of `let_value`, `__sequence`, `exec::repeat_n`, `exec::repeat_until`,
+`exec::repeat` and `associate`, and the received results of `continues_on`,
+are written this way. Algorithms whose nested operations all live as long as
+the operation (`starts_on`, `when_all`) have no phases.
 
 ### Environments
 
