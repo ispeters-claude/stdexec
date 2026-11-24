@@ -235,8 +235,8 @@ operation states in it:
   `__receiver_t<..., __child<I>, ...>`. This is necessary to connect a child
   later (as `__sequence` does), to start it from a nested operation's
   completion (`starts_on`), or to destroy its operation before the algorithm
-  completes (`let_value` puts the child's operation in a variant, where the
-  operation of the sender that the function returns replaces it).
+  completes (`let_value` runs the child in a phase that the phase of the sender
+  that the function returns replaces; see the next section).
 
 An algorithm can start an operation again from that operation's own completion
 (or from the completion of another operation that it started), which is a
@@ -268,6 +268,80 @@ implements the child.)
 Mind the order of the state's members. They are initialized in declaration
 order, so an operation that inspects a child must come before the operation
 that consumes the child.
+
+### Operation states as phases
+
+A nested operation that does not live as long as the algorithm's operation runs
+in a *phase*. `let_value` runs its child, and then the sender that its function
+returns; `__sequence` runs each of its senders in turn; `exec::repeat_n` runs
+each iteration of its body. The helpers in
+`include/stdexec/__detail/__typestate.hpp` give such a state its shape, and
+say once how phases begin and end.
+
+The phases that cannot be live at the same time share a region of the state:
+
+```c++
+__typestate::__phases<__typestate::__phase<__facade::__child<0>, ChildOp>,
+                      __typestate::__phase<__result_op<Ts...>, ResultOp>...>
+  __phases_;
+```
+
+A phase is named by the facade key of its operation, so the key that a
+completion arrives with says which phase it came from. At first no phase is
+live. A region of one phase is an `__optional`, and a region of several a
+`__variant`, so a region costs what the hand-written members did. Things that
+live as long as the operation (the receiver, the data, senders to connect
+later, an operation connected with the operation, such as `continues_on`'s
+schedule operation) are ordinary members.
+
+An algorithm enters, starts and ends phases only with these:
+
+* `phases.__enter<Key>(connect)` enters phase `Key` when the operation is
+  connected: `connect()` returns the phase's operation state.
+* `__typestate::__start<Key>(phases)` starts the operation of the live phase
+  `Key`, and returns `__starts<Key>`.
+* `__typestate::__run<Key>(phases, connect)` ends the live phase, enters phase
+  `Key`, and starts its operation. The phase that ends is usually the one whose
+  completion is being handled, so receive or copy whatever must outlive it
+  first: completion arguments may be in that phase's operation. Do not touch
+  the state after `__run` returns, because the operation it starts may complete
+  inline, and the algorithm's operation can then be destroyed.
+* `__typestate::__catching(rcvr, fn, on_throw)` does `fn()`, which returns a
+  token, and if it throws, does `on_throw()` and sends the exception as an
+  error. Whether `fn` can throw is its exception specification, so give a lambda
+  that cannot throw one: `[&]() noexcept(nothrow) { ... }`. Otherwise the
+  operation declares an error completion that never happens.
+* `__typestate::__receive(storage, tag, args...)` saves a completion in a
+  `__results_storage` (saving the exception as an error if copying throws), and
+  `__typestate::__send_received(storage, rcvr)` sends it later.
+* `phases.__end()` ends the phase of a region of one phase, and
+  `__typestate::__finish_with_copies<Decay>(rcvr, end, tag, args...)` copies a
+  completion's arguments, calls `end()`, and sends the copies, for an algorithm
+  that destroys its nested operations before it completes.
+
+So `__sequence` starts its next sender from the last one's value completion
+like this:
+
+```c++
+return __typestate::__catching(
+  __state.__rcvr_,
+  [&]() noexcept(__nothrow_connectable<__sender_t, __receiver_t>)
+  {
+    return __typestate::__run<__facade::__child<_Idx>>(
+      __state.__phases_,
+      [&]
+      {
+        return STDEXEC::connect(static_cast<__sender_t &&>(
+                                  STDEXEC::__get<_Idx - 1>(__state.__sndrs_)),
+                                __receiver_t{&__state});
+      });
+  });
+```
+
+The phases of `let_value`, `__sequence`, `exec::repeat_n`, `exec::repeat_until`
+and `exec::repeat`, and the received results of `continues_on`, are written
+this way. Algorithms whose nested operations all live as long as the operation
+(`starts_on`, `when_all`) have no phases.
 
 ### Environments
 
