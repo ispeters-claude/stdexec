@@ -34,6 +34,7 @@ import stdexec;
 #  include "__senders.hpp"
 #  include "__subscribe.hpp"
 #  include "__transform_completion_signatures.hpp"
+#  include "__typestate.hpp"
 #  include "__variant.hpp"
 
 #  include "__prologue.hpp"
@@ -647,7 +648,7 @@ namespace STDEXEC
       {
         if constexpr (__nbr != 0)
         {
-          __ops_.__emplace_from(
+          __phases_.template __enter<__facade::__child<0>>(
             [&]
             {
               return STDEXEC::connect(__facade::__get_child<0>(static_cast<_Sender &&>(__sndr)),
@@ -658,10 +659,14 @@ namespace STDEXEC
 
       STDEXEC_IMMOVABLE(__seq_state);
 
-      _Receiver                                                          __rcvr_;
-      typename __later_t::__env2s_t                                      __env2s_;
-      typename __later_t::__senders_t                                    __sndrs_;
-      __variant<connect_result_t<__sender_t<_Is>, __receiver_t<_Is>>...> __ops_{__no_init};
+      _Receiver                       __rcvr_;
+      typename __later_t::__env2s_t   __env2s_;
+      typename __later_t::__senders_t __sndrs_;
+      // The phases: each sender in turn
+      __typestate::__phases<
+        __typestate::__phase<__facade::__child<_Is>,
+                             connect_result_t<__sender_t<_Is>, __receiver_t<_Is>>>...>
+        __phases_;
     };
 
     // __sequence(sndrs...): starts the senders one after the other. Each but the last must
@@ -762,7 +767,7 @@ namespace STDEXEC
         if constexpr (_State::__nbr == 0)
           return __facade::__send(__state.__rcvr_, set_value);
         else
-          return __facade::__start_nested<__facade::__child<0>>(__var::__get<0>(__state.__ops_));
+          return __typestate::__start<__facade::__child<0>>(__state.__phases_);
       }
 
       // A sender completed with a value: the next one starts, unless this was the last.
@@ -809,38 +814,21 @@ namespace STDEXEC
         using __sender_t   = _State::template __sender_t<_Idx>;
         using __receiver_t = _State::template __receiver_t<_Idx>;
 
-        // Connecting the next sender destroys the operation of the one that just completed.
-        auto __start = [&]()
-        {
-          auto &__op = __state.__ops_.__emplace_from(
-            [&]
-            {
-              return STDEXEC::connect(static_cast<__sender_t &&>(
-                                        STDEXEC::__get<_Idx - 1>(__state.__sndrs_)),
-                                      __receiver_t{&__state});
-            });
-          return __facade::__start_nested<__facade::__child<_Idx>>(__op);
-        };
-
-        if constexpr (__nothrow_connectable<__sender_t, __receiver_t>)
-        {
-          return __start();
-        }
-        else
-        {
-          using __result_t =
-            __facade::__union_t<decltype(__start()),
-                                __facade::__effects<set_error_t(std::exception_ptr)>>;
-          STDEXEC_TRY
+        // Running the next sender's phase destroys the operation of the one that just
+        // completed.
+        return __typestate::__catching(
+          __state.__rcvr_,
+          [&]() noexcept(__nothrow_connectable<__sender_t, __receiver_t>)
           {
-            return __result_t(__start());
-          }
-          STDEXEC_CATCH_ALL
-          {
-            return __result_t(
-              __facade::__send(__state.__rcvr_, set_error, std::current_exception()));
-          }
-        }
+            return __typestate::__run<__facade::__child<_Idx>>(
+              __state.__phases_,
+              [&]
+              {
+                return STDEXEC::connect(static_cast<__sender_t &&>(
+                                          STDEXEC::__get<_Idx - 1>(__state.__sndrs_)),
+                                        __receiver_t{&__state});
+              });
+          });
       }
     };
   }  // namespace __seq
