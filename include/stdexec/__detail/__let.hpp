@@ -34,6 +34,7 @@ import stdexec;
 #  include "__sender_facade.hpp"
 #  include "__sender_introspection.hpp"
 #  include "__senders.hpp"
+#  include "__typestate.hpp"
 #  include "__utility.hpp"
 #  include "__variant.hpp"
 
@@ -170,11 +171,14 @@ namespace STDEXEC
         using __op_t    = __result_op_of<__minvoke_or_q<__invoke_result_t, void, __fn_t, _Ts&...>,
                                          __receiver2_t<_Ts...>,
                                          _Ts...>::__t;
+        using __phase_t = __typestate::__phase<__result_op<_Ts...>, __op_t>;
       };
 
-      // The child is connected with the state. The operation of the sender that the
-      // function returns replaces the child's, so that the child's is destroyed once the
-      // function has been called.
+      // The child is connected with the state. The operation runs in two phases: first the
+      // child, and then the sender that the function returns, which replaces the child once
+      // the function has been called. The child's results, which the function is called
+      // with, are received before the child's phase ends, because they may be in the
+      // child's operation.
       using __child_t = __facade::__nth_child_of_t<_Sender, 0>;
       using __child_rcvr_t =
         __facade::__receiver_t<__algo_t, __facade::__child<0>, __state, _Sender, _Receiver>;
@@ -182,9 +186,10 @@ namespace STDEXEC
       template <class... _Lists>
       struct __variants
       {
-        using __args_t = __variant<typename __types<_Lists>::__tuple_t...>;
-        using __ops_t  = __variant<connect_result_t<__child_t, __child_rcvr_t>,
-                                   typename __types<_Lists>::__op_t...>;
+        using __args_t   = __variant<typename __types<_Lists>::__tuple_t...>;
+        using __phases_t = __typestate::__phases<
+          __typestate::__phase<__facade::__child<0>, connect_result_t<__child_t, __child_rcvr_t>>,
+          typename __types<_Lists>::__phase_t...>;
       };
 
       using __variants_t = __mapply_q<__variants, __args_lists_t>;
@@ -200,7 +205,7 @@ namespace STDEXEC
         , __env2_(__mk_secondary_env_t<__set_tag_t>()(__facade::__get_child<0>(__sndr),
                                                       STDEXEC::get_env(__rcvr_)))
       {
-        __ops_.__emplace_from(
+        __phases_.template __enter<__facade::__child<0>>(
           [&]
           {
             return STDEXEC::connect(__facade::__get_child<0>(static_cast<_Sender&&>(__sndr)),
@@ -215,10 +220,10 @@ namespace STDEXEC
       __fn_t         __fn_;
       STDEXEC_IMMOVABLE_NO_UNIQUE_ADDRESS
       __env2_t const __env2_;
-      // The results of the child, and the operation of the child, and then of the sender
-      // that the function returned
+      // The results of the child, received for the function
       typename __variants_t::__args_t __args_{__no_init};
-      typename __variants_t::__ops_t  __ops_{__no_init};
+      // The phases: the child, and then the sender that the function returned
+      typename __variants_t::__phases_t __phases_;
     };
 
     // let_value(sndr, fn), let_error(sndr, fn), and let_stopped(sndr, fn): when the child
@@ -292,7 +297,7 @@ namespace STDEXEC
       STDEXEC_ATTRIBUTE(always_inline, host, device)
       static constexpr auto __start(_State& __state, _Children&) noexcept
       {
-        return __facade::__start_nested<__facade::__child<0>>(__var::__get<0>(__state.__ops_));
+        return __typestate::__start<__facade::__child<0>>(__state.__phases_);
       }
 
       // The child completed with _SetTag: save its results, call the function with them, and
@@ -350,41 +355,24 @@ namespace STDEXEC
                                     && __nothrow_invocable<__fn_t, __decay_t<_Args>&...>
                                     && __nothrow_connectable<__sender2_t, __receiver2_t>;
 
-          // The function is called while the child's operation is still alive. Connecting
-          // the sender it returns then destroys the child's operation.
-          auto __start_next = [&]()
-          {
-            auto&          __tupl  = __state.__args_.__emplace_from(__mktuple,
-                                                          static_cast<_Args&&>(__args)...);
-            decltype(auto) __sndr2 = STDEXEC::__apply(static_cast<__fn_t&&>(__state.__fn_), __tupl);
-            auto&          __op    = __state.__ops_.__emplace_from(
-              [&]()
-              {
-                return STDEXEC::connect(static_cast<__sender2_t&&>(__sndr2),
-                                        __receiver2_t{&__state});
-              });
-            return __facade::__start_nested<__key_t>(__op);
-          };
-
-          if constexpr (__nothrow_v)
-          {
-            return __start_next();
-          }
-          else
-          {
-            using __result_t =
-              __facade::__union_t<decltype(__start_next()),
-                                  __facade::__effects<set_error_t(std::exception_ptr)>>;
-            STDEXEC_TRY
+          // The function is called while the child's operation is still alive. Running the
+          // phase of the sender it returns then destroys the child's operation.
+          return __typestate::__catching(
+            __state.__rcvr_,
+            [&]() noexcept(__nothrow_v)
             {
-              return __result_t(__start_next());
-            }
-            STDEXEC_CATCH_ALL
-            {
-              return __result_t(
-                __facade::__send(__state.__rcvr_, set_error, std::current_exception()));
-            }
-          }
+              auto&          __tupl  = __state.__args_.__emplace_from(__mktuple,
+                                                            static_cast<_Args&&>(__args)...);
+              decltype(auto) __sndr2 = STDEXEC::__apply(static_cast<__fn_t&&>(__state.__fn_),
+                                                        __tupl);
+              return __typestate::__run<__key_t>(__state.__phases_,
+                                                 [&]()
+                                                 {
+                                                   return STDEXEC::connect(
+                                                     static_cast<__sender2_t&&>(__sndr2),
+                                                     __receiver2_t{&__state});
+                                                 });
+            });
         }
       }
 
