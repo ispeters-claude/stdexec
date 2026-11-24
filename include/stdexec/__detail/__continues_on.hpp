@@ -37,6 +37,7 @@ import stdexec;
 #  include "__senders.hpp"
 #  include "__storage.hpp"
 #  include "__tuple.hpp"
+#  include "__typestate.hpp"
 
 #  include "__prologue.hpp"
 
@@ -74,58 +75,6 @@ namespace STDEXEC
     // (The child sees the receiver's environment forwarded.)
     template <class _Child, class _Env>
     inline constexpr bool __child_stays_put_v = __stays_put<__decay_t<_Child>, __fwd_env_t<_Env>>;
-
-    // Saves a completion in __storage, and then starts the nested operation __op, keyed by
-    // _Key. If decay-copying the completion's arguments throws, saves the exception as an
-    // error instead. If they cannot be decay-copied, reports a type error on behalf of
-    // _AlgoTag.
-    template <class _AlgoTag, class _Key, class _Storage, class _OpState, class _Tag, class... _Args>
-    STDEXEC_ATTRIBUTE(host, device)
-    constexpr auto __save_and_start(_Storage& __storage,
-                                    _OpState& __op,
-                                    _Tag      __tag,
-                                    _Args&&... __args) noexcept
-    {
-      if constexpr (!__decay_copyable<_Args...>)
-      {
-        return __facade::__decay_copy_error<_AlgoTag, _Args...>();
-      }
-      else
-      {
-        if constexpr (__nothrow_decay_copyable<_Args...>)
-        {
-          __storage.__emplace_from(__mktuple, __tag, static_cast<_Args&&>(__args)...);
-        }
-        else
-        {
-          STDEXEC_TRY
-          {
-            __storage.__emplace_from(__mktuple, __tag, static_cast<_Args&&>(__args)...);
-          }
-          STDEXEC_CATCH_ALL
-          {
-            __storage.__emplace_from(__mktuple, set_error, std::current_exception());
-          }
-        }
-        return __facade::__start_nested<_Key>(__op);
-      }
-    }
-
-    // Sends the completion that __save_and_start saved
-    template <class _Storage, class _Receiver>
-    STDEXEC_ATTRIBUTE(host, device)
-    constexpr auto __send_saved(_Storage& __storage, _Receiver& __rcvr) noexcept
-    {
-      return __facade::__visit(
-        __storage,
-        [&]<class _Tuple>(_Tuple& __tupl) noexcept
-        {
-          return STDEXEC::__apply(
-            [&]<class _Tag, class... _Args>(_Tag __tag, _Args&... __args) noexcept
-            { return __facade::__send(__rcvr, __tag, static_cast<_Args&&>(__args)...); },
-            __tupl);
-        });
-    }
 
     template <class _Sender, class _Receiver>
     struct __state
@@ -269,7 +218,7 @@ namespace STDEXEC
                                            static_cast<_Receiver&&>(__rcvr));
       }
 
-      // The child completed: save the results, then hop to the scheduler.
+      // The child completed: receive the results, then hop to the scheduler.
       template <class _State, class _Tag, class... _Args>
       STDEXEC_ATTRIBUTE(host, device)
       static constexpr auto __complete(__facade::__child<0>,
@@ -277,19 +226,23 @@ namespace STDEXEC
                                        _Tag    __tag,
                                        _Args&&... __args) noexcept
       {
-        return __trnsfr::__save_and_start<continues_on_t, __sched_op>(__state.__storage_,
-                                                                      __state.__op_,
-                                                                      __tag,
-                                                                      static_cast<_Args&&>(
-                                                                        __args)...);
+        if constexpr (!__decay_copyable<_Args...>)
+        {
+          return __facade::__decay_copy_error<continues_on_t, _Args...>();
+        }
+        else
+        {
+          __typestate::__receive(__state.__storage_, __tag, static_cast<_Args&&>(__args)...);
+          return __facade::__start_nested<__sched_op>(__state.__op_);
+        }
       }
 
-      // On the scheduler: send the saved results.
+      // On the scheduler: send the received results.
       template <class _State>
       STDEXEC_ATTRIBUTE(host, device)
       static constexpr auto __complete(__sched_op, _State& __state, set_value_t) noexcept
       {
-        return __trnsfr::__send_saved(__state.__storage_, __state.__rcvr_);
+        return __typestate::__send_received(__state.__storage_, __state.__rcvr_);
       }
 
       // The schedule operation failed or was stopped.
