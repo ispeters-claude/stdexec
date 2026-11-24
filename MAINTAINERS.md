@@ -103,6 +103,7 @@ These algorithms use the facade, and are good examples:
 | `exec::repeat_n`, `exec::repeat_until`, `exec::repeat` | `exec/detail/repeat.hpp` | loops |
 | `exec::split`, `exec::ensure_started` | `exec/detail/shared.hpp` | a shared operation; a sender that describes another |
 | `associate` | `__associate.hpp` | a nested sender held by the data, known only by its type |
+| `spawn_future` | `__spawn_future.hpp` | waiting for an operation started elsewhere |
 
 ### The shape of an algorithm
 

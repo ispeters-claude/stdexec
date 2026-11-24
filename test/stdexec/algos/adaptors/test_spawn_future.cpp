@@ -36,36 +36,67 @@ namespace ex = STDEXEC;
 
 namespace
 {
+  // A sender that completes with a reference to a string, which the future must copy
+  struct string_ref_sender
+  {
+    using sender_concept        = ex::sender_t;
+    using completion_signatures = ex::completion_signatures<ex::set_value_t(std::string const &)>;
+
+    template <class Receiver>
+    struct operation
+    {
+      using operation_state_concept = ex::operation_state_t;
+
+      void start() & noexcept
+      {
+        ex::set_value(std::move(rcvr_), str_);
+      }
+
+      Receiver    rcvr_;
+      std::string str_{"a string that must be copied"};
+    };
+
+    template <class Receiver>
+    auto connect(Receiver rcvr) const -> operation<Receiver>
+    {
+      return {std::move(rcvr)};
+    }
+  };
+
+  template <class Sender>
+  using future_sigs_t =
+    ex::completion_signatures_of_t<decltype(ex::spawn_future(std::declval<Sender>(), null_token{})),
+                                   ex::env<>>;
+
   TEST_CASE("future completion signature calculation works", "[adaptors][spawn_future]")
   {
     {
       using expected = ex::completion_signatures<ex::set_stopped_t()>;
-      using actual   = ex::__spawn_future::__future_completions_t<ex::env<>>;
+      using actual   = future_sigs_t<decltype(ex::just_stopped())>;
 
       STATIC_REQUIRE(actual{} == expected{});
     }
 
     {
       using expected = ex::completion_signatures<ex::set_stopped_t(), ex::set_value_t()>;
-      using actual   = ex::__spawn_future::__future_completions_t<ex::env<>, ex::set_value_t()>;
+      using actual   = future_sigs_t<decltype(ex::just())>;
 
       STATIC_REQUIRE(actual{} == expected{});
     }
 
     {
       using expected = ex::completion_signatures<ex::set_stopped_t(), ex::set_value_t(std::string)>;
-      using actual =
-        ex::__spawn_future::__future_completions_t<ex::env<>, ex::set_value_t(std::string)>;
+      using actual   = future_sigs_t<decltype(ex::just(std::string()))>;
 
       STATIC_REQUIRE(actual{} == expected{});
     }
 
     {
+      // Copying the string can throw, so the future can complete with the exception.
       using expected = ex::completion_signatures<ex::set_stopped_t(),
                                                  ex::set_error_t(std::exception_ptr),
                                                  ex::set_value_t(std::string)>;
-      using actual =
-        ex::__spawn_future::__future_completions_t<ex::env<>, ex::set_value_t(std::string const &)>;
+      using actual   = future_sigs_t<string_ref_sender>;
 
       STATIC_REQUIRE(actual{} == expected{});
     }
